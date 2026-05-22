@@ -65,7 +65,7 @@
     <exclude body1="table" body2="table_leg_4"/>
   </contact>
 
-  <!-- 传感器 - 只保留红色立方体 -->
+  <!-- 传感器 - 红色立方体 -->
   <sensor>
     <framepos name="red_cube_pos" objtype="body" objname="red_cube"/>
     <framepos name="hand_pos" objtype="body" objname="hand"/>
