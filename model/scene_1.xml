@@ -47,8 +47,8 @@
     </body>
 
     <!-- 红色正方体 -->
-    <body name="red_cube" pos="0.5 0 0.42">
-      <geom name="red_cube_geom" type="box" size="0.04 0.04 0.04" 
+    <body name="red_cube" pos="0.5 0 0.41">
+      <geom name="red_cube_geom" type="box" size="0.03 0.03 0.03" 
             material="red_block" rgba="0.8 0.2 0.2 1"
             mass="0.1" friction="0.7 0.1 0.1" condim="3"/>
       <joint name="red_cube_joint" type="free" damping="0.1"/>
