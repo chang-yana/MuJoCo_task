@@ -1,25 +1,35 @@
 """
-多模型融合智能机械臂控制系统
+多模型融合智能机械臂控制系统。
 
-主要实现了一个完整的智能机械臂控制系统，集成了以下功能：
-- LLM任务规划（基于规则匹配的自然语言指令解析）
-- VLM视觉感知（场景分析和物体识别）
-- MPC速度约束（靠近物体自动减速）
-- 自适应抓取/精确放置
-- 轨迹跟踪（8字形轨迹）
-- 可视化界面
+本程序基于 MuJoCo 和 Franka Emika Panda 机械臂模型，实现自然语言任务解析、
+场景感知、MPC 速度约束、自适应抓取、精确放置、8 字形轨迹跟踪和可视化交互。
 
+主要模块：
+    1. RobotConfig：集中管理模型路径、运动参数、抓取参数和场景参数。
+    2. VLMUnderstanding：从 MuJoCo 仿真状态中读取场景和物体信息。
+    3. LLMTaskPlanner：基于规则匹配解析自然语言命令。
+    4. MPCController：根据目标距离和障碍物距离调整运动步数与速度因子。
+    5. PandaRobot：封装模型加载、关节控制、夹爪控制和物体附着逻辑。
+    6. InverseKinematicsSolver：使用数值优化求解逆运动学。
+    7. MotionController：执行关节空间插值和任务空间运动。
+    8. MCPBridge：分发并执行抓取、放置、移动、回家、释放等命令。
+
+说明：
+    - 夹爪宽度采用“内侧指垫接触面间距”作为外部接口。
+    - 指尖 site 的空间距离仅作为观测值，不作为夹爪控制目标。
+    - 立方体尺寸改为 60 mm，以保证“物体宽度 + 安全余量”不超过 Panda 夹爪最大开口。
+    - 初始夹爪张度为 0，抓取时再张开到目标接触宽度。
 """
+
+import re
+import time
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Tuple
 
 import mujoco
 import mujoco.viewer
 import numpy as np
-import time
-import re
-from dataclasses import dataclass, field
-from typing import List, Tuple, Optional, Dict, Any
 from scipy.optimize import minimize
-from collections import deque
 
 
 # ============================================================================
@@ -55,9 +65,12 @@ class RobotConfig:
         figure8_points: 8字形轨迹点数
         figure8_duration_per_point: 每点停留时间（秒）
         step_size: 相对移动步长（米）
-        gripper_open_max: 夹爪最大张开位置
-        gripper_closed_min: 夹爪最小闭合位置
+        gripper_open_max: 夹爪最大张开宽度（米）
+        gripper_closed_min: 夹爪最小闭合宽度（米）
         cube_width: 立方体边长（米）
+        finger_pad_thickness: 单侧指垫厚度
+        grasp_clearance: 张开时相对物体宽度增加的安全间隙（米）
+        grasp_compression: 闭合抓取时相对物体宽度减少的夹持压缩量（米）
         joint_limits: 关节限位列表
         place_areas: 预设放置区域字典
     """
@@ -78,8 +91,8 @@ class RobotConfig:
 
     # 几何参数
     table_top_z: float = 0.38
-    cube_half_height: float = 0.04
-    cube_center_z: float = 0.42
+    cube_half_height: float = 0.03
+    cube_center_z: float = 0.41
     fingertip_to_center: float = 0.045
 
     # MPC（模型预测控制）参数
@@ -95,9 +108,18 @@ class RobotConfig:
     step_size: float = 0.05
 
     # 夹爪参数
-    gripper_open_max: float = -0.06
-    gripper_closed_min: float = 0.04
-    cube_width: float = 0.08
+    # 注意：Panda 夹爪单个 finger_joint 的 qpos 约为总控制宽度的一半，
+    # 因此 gripper_open_max 通常应接近 2 * q_max。
+    gripper_open_max: float = 0.08
+    gripper_closed_min: float = 0.0
+    cube_width: float = 0.06
+
+    # 指垫与抓取余量参数
+    # finger_pad_thickness 只用于日志说明。夹爪控制目标直接定义为
+    # 左右内侧突出指垫接触面之间的有效距离。
+    finger_pad_thickness: float = 0.008   # 单侧指垫厚度，8 mm
+    grasp_clearance: float = 0.010        # 张开时比物体宽度多出的安全间隙，10 mm
+    grasp_compression: float = 0.001      # 闭合时略小于物体宽度，形成夹持，1 mm
 
     # 关节限位（Panda机械臂官方参数）
     joint_limits: List[Tuple[float, float]] = field(default_factory=lambda: [
@@ -191,7 +213,7 @@ class VLMUnderstanding:
 
 
 # ============================================================================
-# LLM任务规划器（规则匹配版）
+# LLM任务规划器
 # ============================================================================
 
 class LLMTaskPlanner:
@@ -383,7 +405,6 @@ class Figure8Trajectory:
     """
     8字形轨迹生成器
 
-    生成立式的倒8字形轨迹（无穷符号 ∞）。
     """
 
     def __init__(self, size: float = 0.12) -> None:
@@ -500,19 +521,19 @@ class PandaRobot:
             joint_id = self.model.joint(name).id
             self.finger_indices.append(self.model.jnt_qposadr[joint_id])
 
-        # 夹爪body ID
+        # 夹爪 body ID
         self.left_finger_id = self.model.body("left_finger").id
         self.right_finger_id = self.model.body("right_finger").id
 
-        # 指尖site
+        # 指尖 site
         try:
             self.left_finger_tip_id = self.model.site("left_finger_tip").id
             self.right_finger_tip_id = self.model.site("right_finger_tip").id
-        except:
+        except Exception:
             try:
                 self.left_finger_tip_id = self.model.site("left_fingertip").id
                 self.right_finger_tip_id = self.model.site("right_fingertip").id
-            except:
+            except Exception:
                 self.left_finger_tip_id = None
                 self.right_finger_tip_id = None
 
@@ -524,17 +545,18 @@ class PandaRobot:
         try:
             self.cube_body_id = self.model.body("red_cube").id
             self.cube_jnt_addr = self.model.body_jntadr[self.cube_body_id]
-            print(f"  ✅ Red cube found")
+            print("  ✅ Red cube found")
         except Exception as e:
             print(f"  ❌ Red cube not found: {e}")
 
     def set_home(self) -> None:
-        """设置机械臂到Home位置"""
+        """设置机械臂到 Home 位置"""
         for joint_name, joint_pos in self.home_joints.items():
             joint_id = self.model.joint(joint_name).id
             qpos_addr = self.model.jnt_qposadr[joint_id]
             self.data.qpos[qpos_addr] = joint_pos
-        self.open_gripper()
+
+        self.set_gripper_width(0.0)
         mujoco.mj_forward(self.model, self.data)
 
     # ------------------------------------------------------------------------
@@ -552,11 +574,11 @@ class PandaRobot:
             left_tip = self.data.site_xpos[self.left_finger_tip_id]
             right_tip = self.data.site_xpos[self.right_finger_tip_id]
             return (left_tip + right_tip) / 2
-        else:
-            left_pos = self.data.body(self.left_finger_id).xpos.copy()
-            right_pos = self.data.body(self.right_finger_id).xpos.copy()
-            center = (left_pos + right_pos) / 2
-            return center + np.array([0, 0, -self.config.fingertip_to_center])
+
+        left_pos = self.data.body(self.left_finger_id).xpos.copy()
+        right_pos = self.data.body(self.right_finger_id).xpos.copy()
+        center = (left_pos + right_pos) / 2
+        return center + np.array([0, 0, -self.config.fingertip_to_center])
 
     def get_grasp_center(self) -> np.ndarray:
         """
@@ -570,12 +592,12 @@ class PandaRobot:
             right_tip = self.data.site_xpos[self.right_finger_tip_id]
             center = (left_tip + right_tip) / 2
             return center + np.array([0, 0, self.config.grasp_offset_from_tip])
-        else:
-            left_pos = self.data.body(self.left_finger_id).xpos.copy()
-            right_pos = self.data.body(self.right_finger_id).xpos.copy()
-            center = (left_pos + right_pos) / 2
-            fingertip = center + np.array([0, 0, -self.config.fingertip_to_center])
-            return fingertip + np.array([0, 0, self.config.grasp_offset_from_tip])
+
+        left_pos = self.data.body(self.left_finger_id).xpos.copy()
+        right_pos = self.data.body(self.right_finger_id).xpos.copy()
+        center = (left_pos + right_pos) / 2
+        fingertip = center + np.array([0, 0, -self.config.fingertip_to_center])
+        return fingertip + np.array([0, 0, self.config.grasp_offset_from_tip])
 
     def get_current_joint_angles(self) -> np.ndarray:
         """获取当前关节角度"""
@@ -585,6 +607,7 @@ class PandaRobot:
         """应用关节角度到机器人"""
         for i, idx in enumerate(self.arm_indices):
             self.data.qpos[idx] = float(joint_angles[i])
+
         self.data.qvel[self.arm_indices] = 0
         mujoco.mj_forward(self.model, self.data)
 
@@ -602,8 +625,8 @@ class PandaRobot:
         saved_qvel = self.data.qvel.copy()
 
         self.data.qpos[self.arm_indices] = joint_angles[:7]
-        self.data.qpos[self.finger_indices] = [-0.02, -0.02]
         mujoco.mj_forward(self.model, self.data)
+
         position = self.get_fingertip_position()
 
         self.data.qpos[:] = saved_qpos
@@ -649,62 +672,147 @@ class PandaRobot:
     # 夹爪控制方法
     # ------------------------------------------------------------------------
 
-    def close_gripper(self) -> None:
-        """闭合夹爪"""
-        for idx in self.finger_indices:
-            self.data.qpos[idx] = 0.04
-        mujoco.mj_forward(self.model, self.data)
-        self.gripper_closed = True
-        print("    ✊ Gripper closed")
+    def _get_finger_joint_range(self) -> Tuple[float, float]:
+        """获取单个手指关节的运动范围。"""
+        finger_joint_id = self.model.joint(self.finger_joint_names[0]).id
+        q_min, q_max = self.model.jnt_range[finger_joint_id]
+        return float(q_min), float(q_max)
 
-    def close_gripper_to_width(self, target_width: float, viewer_obj=None) -> bool:
+    def _apply_finger_position(self, finger_position: float) -> None:
+        """将同一个关节位置同步应用到左右两个手指。"""
+        for idx in self.finger_indices:
+            self.data.qpos[idx] = finger_position
+
+        self.data.qvel[self.finger_indices] = 0
+        mujoco.mj_forward(self.model, self.data)
+
+    def set_gripper_width(
+        self,
+        target_contact_width: float,
+        viewer_obj=None,
+        steps: int = 20,
+    ) -> bool:
         """
-        自适应闭合夹爪到指定宽度
+        设置夹爪接触宽度。
 
         Args:
-            target_width: 目标宽度（米）
-            viewer_obj: 可视化对象
+            target_contact_width: 左右手指内侧突出指垫接触面之间的目标距离，单位 m。
+                该距离是真正用于容纳或夹持物体的有效开口。
+            viewer_obj: MuJoCo 可视化对象。
+            steps: 插值步数。
 
-        Returns:
-            是否成功
+        说明：
+            物体实际与手指内侧突出的指垫区域接触，因此夹爪控制目标应定义为
+            “内侧指垫接触面间距”，而不是两个指尖 site 的空间距离。
+
+            Panda 夹爪两个手指对称运动时，可近似认为：
+
+                contact_width = finger_joint1 + finger_joint2
+
+            因此单个 finger_joint 的目标位置为：
+
+                single_finger_qpos = contact_width / 2
+
+            get_gripper_width() 测得的是两个指尖 site 的距离，只作为观测和调试信息，
+            不参与目标宽度换算。
         """
-        start_width = self.get_gripper_width()
-        start_pos = self.data.qpos[self.finger_indices[0]]
+        if self.model is None or self.data is None:
+            return False
 
-        target_pos = start_pos + (target_width - start_width) * 0.5
-        target_pos = max(self.config.gripper_closed_min, min(self.config.gripper_open_max, target_pos))
+        if len(self.finger_indices) < 2:
+            print("    ❌ Finger joints not initialized")
+            return False
 
-        print(f"        Adjusting gripper to width {target_width * 1000:.1f}mm")
+        q_min, q_max = self._get_finger_joint_range()
 
-        steps = 15
+        # Panda 夹爪两个手指对称运动：
+        # contact_width ≈ finger_joint1 + finger_joint2
+        max_contact_width = 2.0 * q_max
+        min_contact_width = 2.0 * q_min
+
+        target_contact_width = max(0.0, float(target_contact_width))
+        command_width = float(np.clip(
+            target_contact_width,
+            min_contact_width,
+            max_contact_width
+        ))
+
+        if abs(command_width - target_contact_width) > 1e-9:
+            print(
+                "        ⚠ Gripper contact width exceeds joint limit, "
+                f"desired={target_contact_width * 1000:.1f} mm, "
+                f"clamped={command_width * 1000:.1f} mm"
+            )
+
+        target_finger_pos = command_width / 2.0
+        target_finger_pos = float(np.clip(target_finger_pos, q_min, q_max))
+
+        start_finger_pos = float(self.data.qpos[self.finger_indices[0]])
+
+        print(
+            f"        Target contact width: {target_contact_width * 1000:.1f} mm, "
+            f"command width: {command_width * 1000:.1f} mm, "
+            f"single finger qpos: {target_finger_pos:.4f}"
+        )
+
         for step in range(steps + 1):
             t = step / steps
-            pos = start_pos + t * (target_pos - start_pos)
-            for idx in self.finger_indices:
-                self.data.qpos[idx] = pos
-            mujoco.mj_forward(self.model, self.data)
+            # smoothstep，让夹爪动作更平滑。
+            t_smooth = t * t * (3 - 2 * t)
+
+            current_finger_pos = start_finger_pos + t_smooth * (
+                target_finger_pos - start_finger_pos
+            )
+
+            self._apply_finger_position(current_finger_pos)
+
             if viewer_obj:
                 viewer_obj.sync()
+
             time.sleep(0.01)
 
-        self.gripper_closed = True
+        self.gripper_closed = command_width < self.config.cube_width
+
+        measured_site_width = self.get_gripper_width()
+        print(
+            f"        Measured fingertip site distance: "
+            f"{measured_site_width * 1000:.1f} mm (for reference only)"
+        )
+
         return True
 
     def open_gripper(self) -> None:
-        """张开夹爪（常规张开）"""
-        for idx in self.finger_indices:
-            self.data.qpos[idx] = -0.02
-        mujoco.mj_forward(self.model, self.data)
+        """张开夹爪到模型允许的最大宽度。"""
+        if len(self.finger_indices) < 2:
+            return
+
+        _, q_max = self._get_finger_joint_range()
+        self._apply_finger_position(q_max)
+
         self.gripper_closed = False
         print("    🖐️ Gripper opened")
 
     def open_gripper_wide(self) -> None:
-        """最大张开夹爪"""
-        for idx in self.finger_indices:
-            self.data.qpos[idx] = -0.06
-        mujoco.mj_forward(self.model, self.data)
+        """最大张开夹爪。"""
+        if len(self.finger_indices) < 2:
+            return
+
+        _, q_max = self._get_finger_joint_range()
+        self._apply_finger_position(q_max)
+
         self.gripper_closed = False
         print("    🖐️ Gripper fully opened")
+
+    def close_gripper(self) -> None:
+        """完全闭合夹爪。"""
+        if len(self.finger_indices) < 2:
+            return
+
+        q_min, _ = self._get_finger_joint_range()
+        self._apply_finger_position(q_min)
+
+        self.gripper_closed = True
+        print("    ✊ Gripper closed")
 
     # ------------------------------------------------------------------------
     # 抓取/释放方法
@@ -727,7 +835,7 @@ class PandaRobot:
         grasp_center = self.get_grasp_center()
         self.object_offset = cube_center - grasp_center
         self.grasped_object = "red_cube"
-        print(f"    📦 Cube attached")
+        print("    📦 Cube attached")
         return True
 
     def detach_object(self) -> None:
@@ -738,17 +846,24 @@ class PandaRobot:
 
     def update_attached_object_position(self) -> None:
         """每帧更新附着物体的位置"""
-        if self.grasped_object is not None and self.gripper_closed and self.cube_jnt_addr is not None:
-            try:
-                grasp_center = self.get_grasp_center()
-                target_cube_center = grasp_center + self.object_offset
-                self.data.qpos[self.cube_jnt_addr:self.cube_jnt_addr + 3] = target_cube_center
+        if not (
+            self.grasped_object is not None
+            and self.gripper_closed
+            and self.cube_jnt_addr is not None
+        ):
+            return
 
-                vel_addr = self.cube_jnt_addr * 2
-                if vel_addr + 6 <= len(self.data.qvel):
-                    self.data.qvel[vel_addr:vel_addr + 6] = 0
-            except:
-                pass
+        try:
+            grasp_center = self.get_grasp_center()
+            target_cube_center = grasp_center + self.object_offset
+            self.data.qpos[self.cube_jnt_addr:self.cube_jnt_addr + 3] = target_cube_center
+
+            vel_addr = self.cube_jnt_addr * 2
+            if vel_addr + 6 <= len(self.data.qvel):
+                self.data.qvel[vel_addr:vel_addr + 6] = 0
+        except Exception:
+            # 物体附着更新失败时跳过本帧，避免仿真循环中断。
+            pass
 
 
 # ============================================================================
@@ -804,8 +919,11 @@ class InverseKinematicsSolver:
                 bounds.append((float(jr[0]), float(jr[1])))
         return bounds
 
-    def solve(self, target_pos: np.ndarray,
-              initial_guess: Optional[np.ndarray] = None) -> Tuple[Optional[np.ndarray], float]:
+    def solve(
+        self,
+        target_pos: np.ndarray,
+        initial_guess: Optional[np.ndarray] = None,
+    ) -> Tuple[Optional[np.ndarray], float]:
         """
         求解逆运动学
 
@@ -1170,62 +1288,104 @@ class MCPBridge:
     # 抓取执行
     # ------------------------------------------------------------------------
 
-    def execute_grasp(self, motion_ctrl: MotionController,
-                      ik_solver: InverseKinematicsSolver,
-                      viewer_obj: Optional[mujoco.viewer] = None) -> bool:
+    def execute_grasp(self, motion_ctrl, ik_solver, viewer_obj=None) -> bool:
         """
-        执行抓取操作
+        执行抓取动作。
 
-        流程：
-        1. 张开夹爪到合适宽度（略大于立方体）
-        2. 移动到预抓取位置
-        3. 下降到抓取位置
-        4. 闭合夹爪到抓取宽度
-        5. 附着物体
-        6. 提升
+        正确流程：
+        1. 获取立方体位置
+        2. 张开夹爪到略大于立方体宽度
+        3. 移动到预抓取位置
+        4. 下降到抓取位置
+        5. 闭合夹爪到抓取宽度
+        6. 附着物体
+        7. 提升
         """
         print(f"    Preparing to grasp red cube")
 
+        # 1. 获取立方体中心
         cube_center = self.robot.get_cube_center()
         if cube_center is None:
             print("    ✗ Cube not found")
             return False
 
-        print(f"    📍 Cube center: ({cube_center[0]:.3f}, {cube_center[1]:.3f}, {cube_center[2]:.3f})")
+        print(
+            f"    📍 Cube center: "
+            f"({cube_center[0]:.3f}, {cube_center[1]:.3f}, {cube_center[2]:.3f})"
+        )
 
-        # 张开到略大于立方体的宽度
-        open_width = self.config.cube_width + 0.002  # 0.082m
-        print(f"    🔧 Opening gripper to width {open_width * 1000:.1f}mm")
-        self.robot.close_gripper_to_width(open_width, viewer_obj)
+        # 2. 张开夹爪到略大于立方体宽度。
+        # open_width 表示左右内侧突出指垫接触面之间的有效开口。
+        open_width = self.config.cube_width + self.config.grasp_clearance
+
+        print(f"    🔧 Opening gripper contact width to {open_width * 1000:.1f} mm")
+        self.robot.set_gripper_width(open_width, viewer_obj)
         time.sleep(0.2)
 
-        # 移动到预抓取位置
-        pre_grasp = cube_center + np.array([0, 0, self.config.cube_half_height + 0.08])
-        print(f"    📍 Pre-grasp: ({pre_grasp[0]:.3f}, {pre_grasp[1]:.3f}, {pre_grasp[2]:.3f})")
-        success, _ = motion_ctrl.move_to_position(pre_grasp, ik_solver, viewer_obj)
+        # 3. 移动到预抓取位置
+        pre_grasp = cube_center + np.array([
+            0,
+            0,
+            self.config.cube_half_height + 0.08
+        ])
+
+        print(
+            f"    📍 Pre-grasp: "
+            f"({pre_grasp[0]:.3f}, {pre_grasp[1]:.3f}, {pre_grasp[2]:.3f})"
+        )
+
+        success, error = motion_ctrl.move_to_position(pre_grasp, ik_solver, viewer_obj)
         if not success:
+            print(f"    ❌ Cannot reach pre-grasp position, error={error:.4f}")
             return False
 
-        # 下降到抓取位置（下移2cm，增加接触面积）
-        grasp_pos = cube_center + np.array([0, 0, self.config.cube_half_height - 0.02])
-        print(f"    📍 Grasp point: ({grasp_pos[0]:.3f}, {grasp_pos[1]:.3f}, {grasp_pos[2]:.3f})")
-        success, _ = motion_ctrl.move_to_position(grasp_pos, ik_solver, viewer_obj)
+        # 4. 下降到抓取位置
+        grasp_pos = cube_center + np.array([
+            0,
+            0,
+            self.config.cube_half_height - 0.02
+        ])
+
+        print(
+            f"    📍 Grasp point: "
+            f"({grasp_pos[0]:.3f}, {grasp_pos[1]:.3f}, {grasp_pos[2]:.3f})"
+        )
+
+        success, error = motion_ctrl.move_to_position(grasp_pos, ik_solver, viewer_obj)
         if not success:
+            print(f"    ❌ Cannot reach grasp position, error={error:.4f}")
             return False
 
-        # 闭合到抓取宽度
-        grip_width = self.config.cube_width - 0.003  # 0.077m
-        print(f"    🔧 Closing gripper to grip width {grip_width * 1000:.1f}mm")
-        self.robot.close_gripper_to_width(grip_width, viewer_obj)
+        # 5. 闭合夹爪到抓取宽度。
+        # grip_width 表示夹持时的内侧指垫接触面间距，略小于立方体宽度。
+        grip_width = self.config.cube_width - self.config.grasp_compression
+
+        print(f"    🔧 Closing gripper contact width to {grip_width * 1000:.1f} mm")
+        self.robot.set_gripper_width(grip_width, viewer_obj)
         time.sleep(0.2)
 
-        # 附着物体
-        self.robot.attach_cube()
+        # 6. 附着物体
+        attached = self.robot.attach_cube()
+        if not attached:
+            print("    ❌ Failed to attach cube")
+            return False
 
-        # 提升
-        lift_pos = grasp_pos + np.array([0, 0, self.config.grasp_post_offset])
-        print(f"    📍 Lift: ({lift_pos[0]:.3f}, {lift_pos[1]:.3f}, {lift_pos[2]:.3f})")
-        motion_ctrl.move_to_position(lift_pos, ik_solver, viewer_obj)
+        # 7. 提升
+        lift_pos = grasp_pos + np.array([
+            0,
+            0,
+            self.config.grasp_post_offset
+        ])
+
+        print(
+            f"    📍 Lift: "
+            f"({lift_pos[0]:.3f}, {lift_pos[1]:.3f}, {lift_pos[2]:.3f})"
+        )
+
+        success, error = motion_ctrl.move_to_position(lift_pos, ik_solver, viewer_obj)
+        if not success:
+            print(f"    ⚠ Cube attached, but lift motion failed, error={error:.4f}")
+            return False
 
         print("    ✅ Grasp successful!")
         return True
@@ -1325,8 +1485,6 @@ class MCPBridge:
             print(f"    ⚠ Warning: X coordinate {x:.3f} may be out of reachable range")
         if y < -0.5 or y > 0.5:
             print(f"    ⚠ Warning: Y coordinate {y:.3f} may be out of reachable range")
-
-        cube_center_target = np.array([x, y, self.config.cube_center_z])
 
         cube_center_target = np.array([x, y, self.config.cube_center_z])
 
@@ -1505,7 +1663,7 @@ class MCPBridge:
         print(f"      Target angles:  {home_angles.round(3)}")
 
         motion_ctrl.move_to_joints(home_angles, viewer_obj)
-        self.robot.open_gripper()
+        self.robot.set_gripper_width(0.0, viewer_obj)
 
         print(f"    ✅ Returned to home position smoothly")
         return True

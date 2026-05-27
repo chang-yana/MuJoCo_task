@@ -116,7 +116,7 @@ class PandaRobot:
 
         # 手指微张
         for idx in self.finger_indices:
-            self.data.qpos[idx] = -0.02
+            self.data.qpos[idx] = 0
 
         mujoco.mj_forward(self.model, self.data)
         print("✓ 设置Home位置完成")
@@ -141,7 +141,7 @@ class PandaRobot:
 
         # 设置测试关节角度
         self.data.qpos[self.arm_indices] = joint_angles[:7]
-        self.data.qpos[self.finger_indices] = [-0.02, -0.02]
+        self.data.qpos[self.finger_indices] = [0, 0]
 
         # 正向动力学更新
         mujoco.mj_forward(self.model, self.data)
@@ -164,7 +164,7 @@ class PandaRobot:
         """应用关节角度到机器人"""
         for i, idx in enumerate(self.arm_indices):
             self.data.qpos[idx] = float(joint_angles[i])
-        self.data.qpos[self.finger_indices] = [-0.02, -0.02]
+        self.data.qpos[self.finger_indices] = [0, 0]
         self.data.qvel[self.arm_indices] = 0
         mujoco.mj_forward(self.model, self.data)
 
