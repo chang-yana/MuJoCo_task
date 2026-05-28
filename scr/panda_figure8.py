@@ -3,709 +3,778 @@ Panda机械臂倒8字形轨迹跟踪控制程序（立式倒8字形）
 功能: 实现机械臂末端执行器跟踪立式的倒8字形轨迹（无穷符号）
 """
 
+import os
+import time
+from dataclasses import dataclass
+from typing import Any, List, Optional, Tuple, cast
+
 import mujoco
 import mujoco.viewer
 import numpy as np
-import time
-from scipy.optimize import minimize
-from dataclasses import dataclass
-from typing import List, Tuple, Optional
+from scipy.optimize import OptimizeResult, minimize
+
+
+os.environ["MUJOCO_GL"] = "glfw"
 
 
 # ============================================
-# 配置参数类
+# 配置参数
 # ============================================
 @dataclass
 class RobotConfig:
-    """机器人配置参数"""
-    # 模型路径
+    """机器人配置参数。"""
+
     model_path: str = r"D:\Mujoco\mujoco_menagerie-main\franka_emika_panda\scene.xml"
 
-    # 运动控制参数
-    move_steps: int = 200  # 运动插值步数
-    move_dt: float = 0.01  # 每步时间间隔(秒)
-    pause_time: float = 1.0  # 点间暂停时间(秒)
+    move_steps: int = 200
+    move_dt: float = 0.01
+    pause_time: float = 1.0
 
-    # IK求解参数
-    ik_max_attempts: int = 3  # 最大尝试次数
-    ik_max_iter: int = 200  # 最大迭代次数
-    ik_tolerance: float = 1e-4  # IK收敛精度(m)
+    ik_max_attempts: int = 3
+    ik_max_iter: int = 200
+    ik_tolerance: float = 1e-4
 
-    # 轨迹跟踪参数
-    trajectory_duration_per_point: float = 0.025  # 每点停留时间(秒)
-    trajectory_display_points: int = 60  # 显示用轨迹点数
-    trajectory_control_points: int = 200  # 控制用轨迹点数
+    trajectory_duration_per_point: float = 0.025
+    trajectory_display_points: int = 60
+    trajectory_control_points: int = 200
 
-    # 倒8字形轨迹参数
-    trajectory_center: np.ndarray = None  # 轨迹中心
-    trajectory_size: float = 0.12  # 轨迹大小(米)
-    trajectory_height: float = 0.00  # 高度波动(米)
-    trajectory_orientation: str = "vertical_xz"  # 轨迹方向: "horizontal_xy"(水平), "vertical_xz"(立式), "vertical_yz"(侧立式)
+    trajectory_center: Optional[np.ndarray] = None
+    trajectory_size: float = 0.12
+    trajectory_height: float = 0.00
+    trajectory_orientation: str = "vertical_xz"
 
-    # Panda机械臂关节限位(弧度)
-    joint_limits: List[Tuple[float, float]] = None
+    joint_limits: Optional[List[Tuple[float, float]]] = None
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if self.joint_limits is None:
             self.joint_limits = [
-                (-2.8973, 2.8973),  # joint1
-                (-1.7628, 1.7628),  # joint2
-                (-2.8973, 2.8973),  # joint3
-                (-3.0718, -0.0698),  # joint4
-                (-2.8973, 2.8973),  # joint5
-                (-0.0175, 3.7525),  # joint6
-                (-2.8973, 2.8973)  # joint7
+                (-2.8973, 2.8973),
+                (-1.7628, 1.7628),
+                (-2.8973, 2.8973),
+                (-3.0718, -0.0698),
+                (-2.8973, 2.8973),
+                (-0.0175, 3.7525),
+                (-2.8973, 2.8973),
             ]
+
         if self.trajectory_center is None:
-            self.trajectory_center = np.array([0.45, 0.0, 0.45])
+            self.trajectory_center = np.array([0.45, 0.0, 0.45], dtype=float)
 
 
 # ============================================
-# 倒8字形轨迹生成器
+# 工具函数
+# ============================================
+def format_pos(pos: np.ndarray) -> str:
+    """将三维位置向量格式化为字符串。"""
+    return (
+        f"({float(pos[0]):.3f}, "
+        f"{float(pos[1]):.3f}, "
+        f"{float(pos[2]):.3f})"
+    )
+
+
+# ============================================
+# 倒 8 字形轨迹生成器
 # ============================================
 class Figure8Trajectory:
+    """倒 8 字形轨迹生成器。"""
 
-    def __init__(self, center: np.ndarray, size: float = 0.12, height: float = 0.04,
-                 orientation: str = "horizontal_xy"):
-        """
-        初始化轨迹生成器
-        Args:
-            center: 轨迹中心点 [x, y, z]
-            size: 轨迹大小（米）
-            height: 轨迹的垂直波动幅度（米）
-            orientation: 轨迹方向
-                - "horizontal_xy": 水平倒8字形（在XY平面，默认）
-                - "vertical_xz": 立式倒8字形（在XZ平面，面对Y轴正方向）
-                - "vertical_yz": 侧立式倒8字形（在YZ平面，面对X轴正方向）
-        """
-        self.center = center
-        self.size = size
-        self.height = height
+    def __init__(
+        self,
+        center: np.ndarray,
+        size: float = 0.12,
+        height: float = 0.04,
+        orientation: str = "horizontal_xy",
+    ) -> None:
+        self.center = np.asarray(center, dtype=float)
+        self.size = float(size)
+        self.height = float(height)
         self.orientation = orientation
 
     def get_position(self, t: float) -> np.ndarray:
-        """
-        根据参数 t ∈ [0, 1] 获取轨迹上的位置
-        """
-        theta = 2 * np.pi * t
+        """根据参数 t 获取轨迹上的位置，t 的范围为 [0, 1]。"""
+        theta = 2.0 * np.pi * float(t)
 
-        # 基础倒8字形参数
-        horizontal = self.size * np.sin(theta)  # 水平方向摆动
-        cross = self.size * 0.5 * np.sin(2 * theta)  # 交叉方向（形成8字）
-        vertical = self.height * np.sin(theta)  # 垂直方向波动
+        horizontal = self.size * np.sin(theta)
+        cross = self.size * 0.5 * np.sin(2.0 * theta)
+        vertical = self.height * np.sin(theta)
 
         if self.orientation == "horizontal_xy":
-            # 水平倒8字形（在XY平面，像躺着的8）
-            x = self.center[0] + horizontal
-            y = self.center[1] + cross
-            z = self.center[2] + vertical
-
+            x_pos = self.center[0] + horizontal
+            y_pos = self.center[1] + cross
+            z_pos = self.center[2] + vertical
         elif self.orientation == "vertical_xz":
-            # 立式倒8字形（在XZ平面，面对自己）
-            x = self.center[0] + horizontal  # 左右摆动
-            y = self.center[1] + vertical
-            z = self.center[2] + cross  # 上下画8字
-
+            x_pos = self.center[0] + horizontal
+            y_pos = self.center[1] + vertical
+            z_pos = self.center[2] + cross
         elif self.orientation == "vertical_yz":
-            # 侧立式倒8字形（在YZ平面）
-            x = self.center[0] + vertical
-            y = self.center[1] + horizontal
-            z = self.center[2] + cross
-
+            x_pos = self.center[0] + vertical
+            y_pos = self.center[1] + horizontal
+            z_pos = self.center[2] + cross
         else:
-            # 默认水平
-            x = self.center[0] + horizontal
-            y = self.center[1] + cross
-            z = self.center[2] + vertical
+            x_pos = self.center[0] + horizontal
+            y_pos = self.center[1] + cross
+            z_pos = self.center[2] + vertical
 
-        return np.array([x, y, z])
+        return np.array([x_pos, y_pos, z_pos], dtype=float)
 
     def generate_trajectory(self, num_points: int = 200) -> List[np.ndarray]:
-        """生成离散轨迹点"""
-        trajectory = []
-        for i in range(num_points + 1):
-            t = i / num_points
-            trajectory.append(self.get_position(t))
-        return trajectory
+        """生成离散轨迹点。"""
+        points: List[np.ndarray] = []
+
+        for index in range(num_points + 1):
+            t = float(index) / float(num_points)
+            points.append(self.get_position(t))
+
+        return points
 
 
 # ============================================
-# Panda机械臂类
+# Panda 机械臂
 # ============================================
 class PandaRobot:
-    """Panda机械臂控制类"""
+    """Panda 机械臂控制类。"""
 
-    def __init__(self, config: RobotConfig):
+    def __init__(self, config: RobotConfig) -> None:
         self.config = config
-        self.model = None
-        self.data = None
 
-        # 关节信息
-        self.arm_joint_names = ["joint1", "joint2", "joint3", "joint4",
-                                "joint5", "joint6", "joint7"]
-        self.finger_joint_names = ["finger_joint1", "finger_joint2"]
+        self.model: Optional[mujoco.MjModel] = None
+        self.data: Optional[mujoco.MjData] = None
 
-        self.arm_indices = []
-        self.finger_indices = []
-        self.left_finger_id = None
-        self.right_finger_id = None
+        self.arm_joint_names = [
+            "joint1",
+            "joint2",
+            "joint3",
+            "joint4",
+            "joint5",
+            "joint6",
+            "joint7",
+        ]
 
-        # Home位置配置(标准工作姿态)
+        self.finger_joint_names = [
+            "finger_joint1",
+            "finger_joint2",
+        ]
+
+        self.arm_indices: List[int] = []
+        self.finger_indices: List[int] = []
+
+        self.left_finger_id: Optional[int] = None
+        self.right_finger_id: Optional[int] = None
+
         self.home_joints = {
             "joint1": 0.0,
-            "joint2": -0.785,  # -45度
+            "joint2": -0.785,
             "joint3": 0.0,
-            "joint4": -2.356,  # -135度
+            "joint4": -2.356,
             "joint5": 0.0,
-            "joint6": 1.571,  # 90度
-            "joint7": 0.785,  # 45度
+            "joint6": 1.571,
+            "joint7": 0.785,
         }
 
+    def _require_model_data(self) -> Tuple[mujoco.MjModel, mujoco.MjData]:
+        """检查模型和数据是否已加载，并返回 model 和 data。"""
+        if self.model is None or self.data is None:
+            raise RuntimeError("MuJoCo 模型尚未加载，请先调用 load_model()。")
+        return self.model, self.data
+
+    def _require_finger_ids(self) -> Tuple[int, int]:
+        """返回左右手指的 body ID。"""
+        if self.left_finger_id is None or self.right_finger_id is None:
+            raise RuntimeError("手指 body ID 尚未初始化。")
+        return self.left_finger_id, self.right_finger_id
+
     def load_model(self) -> None:
-        """加载URDF模型"""
+        """加载 MuJoCo 模型。"""
         self.model = mujoco.MjModel.from_xml_path(self.config.model_path)
         self.data = mujoco.MjData(self.model)
         print("✓ 模型加载成功")
 
     def setup_joint_indices(self) -> None:
-        """设置关节索引"""
-        # 手臂关节索引
+        """设置手臂关节和手指关节的索引。"""
+        model, _ = self._require_model_data()
+
+        self.arm_indices.clear()
+        self.finger_indices.clear()
+
         for name in self.arm_joint_names:
-            joint_id = self.model.joint(name).id
-            self.arm_indices.append(self.model.jnt_qposadr[joint_id])
+            joint_id = model.joint(name).id
+            self.arm_indices.append(int(model.jnt_qposadr[joint_id]))
 
-        # 手指关节索引
         for name in self.finger_joint_names:
-            joint_id = self.model.joint(name).id
-            self.finger_indices.append(self.model.jnt_qposadr[joint_id])
+            joint_id = model.joint(name).id
+            self.finger_indices.append(int(model.jnt_qposadr[joint_id]))
 
-        # 手指body ID
-        self.left_finger_id = self.model.body("left_finger").id
-        self.right_finger_id = self.model.body("right_finger").id
+        self.left_finger_id = int(model.body("left_finger").id)
+        self.right_finger_id = int(model.body("right_finger").id)
 
         print(f"✓ 手臂关节数: {len(self.arm_indices)}")
-        print(f"✓ 找到左手指: left_finger (id={self.left_finger_id})")
-        print(f"✓ 找到右手指: right_finger (id={self.right_finger_id})")
+        print(f"✓ 找到左手指: left_finger, id={self.left_finger_id}")
+        print(f"✓ 找到右手指: right_finger, id={self.right_finger_id}")
 
     def set_home_position(self) -> None:
-        """设置机械臂到Home位置(标准工作姿态)"""
+        """将机械臂移动到 Home 初始姿态。"""
+        model, data = self._require_model_data()
+
         for joint_name, joint_pos in self.home_joints.items():
-            joint_id = self.model.joint(joint_name).id
-            qpos_addr = self.model.jnt_qposadr[joint_id]
-            self.data.qpos[qpos_addr] = joint_pos
+            joint_id = model.joint(joint_name).id
+            position_address = model.jnt_qposadr[joint_id]
+            data.qpos[position_address] = float(joint_pos)
 
-        # 手指微张
-        for idx in self.finger_indices:
-            self.data.qpos[idx] = 0
+        for index in self.finger_indices:
+            data.qpos[index] = 0.0
 
-        mujoco.mj_forward(self.model, self.data)
-        print("✓ 设置Home位置完成")
+        mujoco.mj_forward(model, data)
+        print("✓ 设置 Home 位置完成")
 
     def get_end_effector_position(self) -> np.ndarray:
-        """获取末端执行器位置(两手指中心点)"""
-        left_pos = self.data.body(self.left_finger_id).xpos.copy()
-        right_pos = self.data.body(self.right_finger_id).xpos.copy()
-        return (left_pos + right_pos) / 2
+        """返回末端执行器中心位置。"""
+        _, data = self._require_model_data()
+        left_finger_id, right_finger_id = self._require_finger_ids()
+
+        left_pos = data.body(left_finger_id).xpos.copy()
+        right_pos = data.body(right_finger_id).xpos.copy()
+
+        return np.asarray((left_pos + right_pos) / 2.0, dtype=float)
 
     def forward_kinematics(self, joint_angles: np.ndarray) -> np.ndarray:
-        """
-        正向运动学: 给定关节角度,返回末端位置
-        Args:
-            joint_angles: 7个关节角度
-        Returns:
-            末端执行器位置 [x, y, z]
-        """
-        # 保存当前状态
-        saved_qpos = self.data.qpos.copy()
-        saved_qvel = self.data.qvel.copy()
+        """根据关节角计算末端执行器位置。"""
+        model, data = self._require_model_data()
+        joint_angles = np.asarray(joint_angles, dtype=float)
 
-        # 设置测试关节角度
-        self.data.qpos[self.arm_indices] = joint_angles[:7]
-        self.data.qpos[self.finger_indices] = [0, 0]
+        saved_positions = data.qpos.copy()
+        saved_velocities = data.qvel.copy()
 
-        # 正向动力学更新
-        mujoco.mj_forward(self.model, self.data)
+        data.qpos[self.arm_indices] = joint_angles[:7]
+        data.qpos[self.finger_indices] = [0.0, 0.0]
 
-        # 获取末端位置
+        mujoco.mj_forward(model, data)
+
         position = self.get_end_effector_position()
 
-        # 恢复状态
-        self.data.qpos[:] = saved_qpos
-        self.data.qvel[:] = saved_qvel
-        mujoco.mj_forward(self.model, self.data)
+        data.qpos[:] = saved_positions
+        data.qvel[:] = saved_velocities
+
+        mujoco.mj_forward(model, data)
 
         return position
 
     def get_current_joint_angles(self) -> np.ndarray:
-        """获取当前关节角度"""
-        return self.data.qpos[self.arm_indices].copy()
+        """返回当前机械臂关节角。"""
+        _, data = self._require_model_data()
+        return np.asarray(data.qpos[self.arm_indices].copy(), dtype=float)
 
     def apply_joint_angles(self, joint_angles: np.ndarray) -> None:
-        """应用关节角度到机器人"""
-        for i, idx in enumerate(self.arm_indices):
-            self.data.qpos[idx] = float(joint_angles[i])
-        self.data.qpos[self.finger_indices] = [0, 0]
-        self.data.qvel[self.arm_indices] = 0
-        mujoco.mj_forward(self.model, self.data)
+        """将关节角应用到机械臂模型中。"""
+        model, data = self._require_model_data()
+        joint_angles = np.asarray(joint_angles, dtype=float)
+
+        for index, joint_index in enumerate(self.arm_indices):
+            data.qpos[joint_index] = float(joint_angles[index])
+
+        data.qpos[self.finger_indices] = [0.0, 0.0]
+        data.qvel[self.arm_indices] = 0.0
+
+        mujoco.mj_forward(model, data)
 
 
 # ============================================
-# 逆运动学求解器类
+# 逆运动学求解器
 # ============================================
 class InverseKinematicsSolver:
-    """逆运动学求解器(使用数值优化)"""
+    """数值逆运动学求解器。"""
 
-    def __init__(self, robot: PandaRobot, config: RobotConfig):
+    def __init__(self, robot: PandaRobot, config: RobotConfig) -> None:
         self.robot = robot
         self.config = config
 
     def _ik_cost(self, joint_angles: np.ndarray, target_pos: np.ndarray) -> float:
-        """IK成本函数: 末端位置与目标位置的欧氏距离"""
+        """逆运动学优化的代价函数。"""
+        joint_angles = np.asarray(joint_angles, dtype=float)
+        target_pos = np.asarray(target_pos, dtype=float)
+
         current_pos = self.robot.forward_kinematics(joint_angles)
         return float(np.linalg.norm(current_pos - target_pos))
 
     def _get_bounds(self) -> List[Tuple[float, float]]:
-        """获取关节边界约束"""
-        bounds = []
-        for i, idx in enumerate(self.robot.arm_indices):
-            joint_range = self.robot.model.jnt_range[idx]
-            # 如果模型未定义限位,使用配置中的限位
-            if joint_range[0] == 0 and joint_range[1] == 0:
-                bounds.append(self.config.joint_limits[i])
+        """返回各关节的角度约束范围。"""
+        model, _ = self.robot._require_model_data()
+
+        if self.config.joint_limits is None:
+            raise RuntimeError("关节限位尚未初始化。")
+
+        bounds: List[Tuple[float, float]] = []
+
+        for index, joint_name in enumerate(self.robot.arm_joint_names):
+            joint_id = model.joint(joint_name).id
+            joint_range = model.jnt_range[joint_id]
+
+            if float(joint_range[0]) == 0.0 and float(joint_range[1]) == 0.0:
+                bounds.append(self.config.joint_limits[index])
             else:
                 bounds.append((float(joint_range[0]), float(joint_range[1])))
+
         return bounds
 
-    def solve(self, target_pos: np.ndarray,
-              initial_guess: Optional[np.ndarray] = None) -> Tuple[np.ndarray, float]:
-        """
-        求解逆运动学
-        Args:
-            target_pos: 目标位置 [x, y, z]
-            initial_guess: 初始猜测关节角度,为None时使用当前关节角度
-        Returns:
-            (关节角度解, 位置误差)
-        """
+    def solve(
+        self,
+        target_pos: np.ndarray,
+        initial_guess: Optional[np.ndarray] = None,
+    ) -> Tuple[np.ndarray, float]:
+        """求解逆运动学。"""
+        target_pos = np.asarray(target_pos, dtype=float)
+
         if initial_guess is None:
             initial_guess = self.robot.get_current_joint_angles()
+        else:
+            initial_guess = np.asarray(initial_guess, dtype=float)
 
-        best_solution = None
-        best_error = float('inf')
+        best_solution: Optional[np.ndarray] = None
+        best_error = float("inf")
 
         for attempt in range(self.config.ik_max_attempts):
-            # 添加随机扰动(帮助跳出局部最优)
             if attempt > 0:
-                noise = np.random.uniform(-0.1, 0.1, len(initial_guess))
+                noise = np.random.uniform(-0.1, 0.1, size=len(initial_guess))
                 x0 = initial_guess + noise
             else:
                 x0 = initial_guess.copy()
 
-            # 优化求解
-            result = minimize(
-                self._ik_cost,
-                x0,
+            # 忽略 PyCharm 对 scipy.optimize.minimize 参数类型的误报
+            # noinspection PyTypeChecker
+            result: OptimizeResult = minimize(
+                fun=self._ik_cost,
+                x0=np.asarray(x0, dtype=float),
                 args=(target_pos,),
-                method='L-BFGS-B',
+                method="L-BFGS-B",
                 bounds=self._get_bounds(),
-                options={'maxiter': self.config.ik_max_iter, 'ftol': 1e-6}
+                options={
+                    "maxiter": int(self.config.ik_max_iter),
+                    "ftol": 1e-6,
+                },
             )
 
-            if result.fun < best_error:
-                best_error = result.fun
-                best_solution = result.x
+            result_error = float(result.fun)
+
+            if result_error < best_error:
+                best_error = result_error
+                best_solution = np.asarray(result.x, dtype=float)
 
             if best_error < self.config.ik_tolerance:
                 break
+
+        if best_solution is None:
+            return initial_guess.copy(), best_error
 
         return best_solution, best_error
 
 
 # ============================================
-# 运动控制器类
+# 运动控制器
 # ============================================
 class MotionController:
-    """运动控制器(处理平滑插值运动)"""
+    """带平滑插值的运动控制器。"""
 
-    def __init__(self, robot: PandaRobot, config: RobotConfig):
+    def __init__(self, robot: PandaRobot, config: RobotConfig) -> None:
         self.robot = robot
         self.config = config
 
     @staticmethod
     def _normalize_angle(angle: float) -> float:
-        """归一化角度到 [-π, π]"""
+        """将角度归一化到 [-pi, pi] 范围内。"""
         angle = float(angle)
+
         while angle > np.pi:
             angle -= 2.0 * np.pi
+
         while angle < -np.pi:
             angle += 2.0 * np.pi
+
         return angle
 
     @staticmethod
     def _smoothstep(t: float) -> float:
-        """平滑步进函数(S曲线)"""
-        return t * t * (3 - 2 * t)
+        """平滑插值函数。"""
+        return t * t * (3.0 - 2.0 * t)
 
-    def move_to_joints(self, target_joints: np.ndarray,
-                       viewer_obj: Optional[mujoco.viewer] = None) -> None:
-        """
-        平滑移动到目标关节角度
-        Args:
-            target_joints: 目标关节角度
-            viewer_obj: MuJoCo可视化对象
-        """
+    def move_to_joints(
+        self,
+        target_joints: np.ndarray,
+        viewer_obj: Optional[Any] = None,
+    ) -> None:
+        """移动到目标关节角。"""
+        target_joints = np.asarray(target_joints, dtype=float)
         start_joints = self.robot.get_current_joint_angles()
 
         print(f"      运动步数: {self.config.move_steps}")
 
         for step in range(self.config.move_steps + 1):
-            t = step / self.config.move_steps
+            t = float(step) / float(self.config.move_steps)
             t_smooth = self._smoothstep(t)
 
-            # 线性插值
             current_joints = start_joints + t_smooth * (target_joints - start_joints)
 
-            # 角度归一化
-            for i in range(len(current_joints)):
-                current_joints[i] = self._normalize_angle(current_joints[i])
+            for index in range(len(current_joints)):
+                current_joints[index] = self._normalize_angle(float(current_joints[index]))
 
-            # 应用到机器人
             self.robot.apply_joint_angles(current_joints)
 
-            # 同步视图
             if viewer_obj is not None:
-                viewer_obj.sync()
+                cast(Any, viewer_obj).sync()
 
-            # 控制速度
             time.sleep(self.config.move_dt)
 
-            # 打印进度
             if step % 40 == 0:
-                percent = (step / self.config.move_steps) * 100
+                percent = float(step) / float(self.config.move_steps) * 100.0
                 print(f"\r      运动进度: {percent:.0f}%", end="", flush=True)
 
-        print(f"\r      运动进度: 100% ✓")
+        print("\r      运动进度: 100% ✓")
 
-    def move_to_position(self, target_pos: np.ndarray,
-                         ik_solver: InverseKinematicsSolver,
-                         viewer_obj: Optional[mujoco.viewer] = None) -> Tuple[bool, float]:
-        """
-        移动到目标空间位置
-        Args:
-            target_pos: 目标位置
-            ik_solver: 逆运动学求解器
-            viewer_obj: 可视化对象
-        Returns:
-            (是否成功, 定位误差)
-        """
-        # 求解逆运动学
+    def move_to_position(
+        self,
+        target_pos: np.ndarray,
+        ik_solver: InverseKinematicsSolver,
+        viewer_obj: Optional[Any] = None,
+    ) -> Tuple[bool, float]:
+        """移动到目标笛卡尔空间位置。"""
+        target_pos = np.asarray(target_pos, dtype=float)
+
         current_angles = self.robot.get_current_joint_angles()
         solution, ik_error = ik_solver.solve(target_pos, current_angles)
 
-        if ik_error >= 0.02:  # 误差大于2cm认为失败
+        if ik_error >= 0.02:
             return False, float(ik_error)
 
-        # 执行运动
         self.move_to_joints(solution, viewer_obj)
 
-        # 验证最终位置
         actual_pos = self.robot.get_end_effector_position()
         position_error = float(np.linalg.norm(actual_pos - target_pos))
 
         return True, position_error
 
-    def follow_trajectory(self, trajectory: List[np.ndarray],
-                          ik_solver: InverseKinematicsSolver,
-                          viewer_obj: Optional[mujoco.viewer] = None) -> None:
-        """
-        跟踪轨迹
-        Args:
-            trajectory: 轨迹点列表
-            ik_solver: 逆运动学求解器
-            viewer_obj: 可视化对象
-        """
+    def follow_trajectory(
+        self,
+        trajectory: List[np.ndarray],
+        ik_solver: InverseKinematicsSolver,
+        viewer_obj: Optional[Any] = None,
+    ) -> None:
+        """逐点跟踪轨迹。"""
         print(f"      轨迹点数: {len(trajectory)}")
 
         success_count = 0
         current_angles = self.robot.get_current_joint_angles()
 
-        for i, target_pos in enumerate(trajectory):
-            # 求解逆运动学
+        for index, target_pos in enumerate(trajectory):
+            target_pos = np.asarray(target_pos, dtype=float)
+
             solution, ik_error = ik_solver.solve(target_pos, current_angles)
 
             if ik_error < 0.02:
-                # 应用到机器人
                 self.robot.apply_joint_angles(solution)
                 current_angles = solution
                 success_count += 1
 
-            # 同步视图
             if viewer_obj is not None:
-                viewer_obj.sync()
+                cast(Any, viewer_obj).sync()
 
-            # 控制速度
             time.sleep(self.config.trajectory_duration_per_point)
 
-            # 打印进度
-            if (i + 1) % 50 == 0:
-                percent = (i + 1) / len(trajectory) * 100
+            if (index + 1) % 50 == 0:
+                percent = float(index + 1) / float(len(trajectory)) * 100.0
                 print(f"\r      轨迹跟踪进度: {percent:.0f}%", end="", flush=True)
 
-        print(f"\r      轨迹跟踪进度: 100% ✓")
-        print(f"      IK成功率: {success_count}/{len(trajectory)} ({100 * success_count / len(trajectory):.1f}%)")
+        success_rate = 100.0 * float(success_count) / float(len(trajectory))
+
+        print("\r      轨迹跟踪进度: 100% ✓")
+        print(f"      IK 成功率: {success_count}/{len(trajectory)} ({success_rate:.1f}%)")
 
 
 # ============================================
 # 可视化辅助类
 # ============================================
 class Visualizer:
-    """可视化辅助类"""
+    """MuJoCo 可视化辅助类。"""
 
-    def __init__(self, robot: PandaRobot):
+    def __init__(self, robot: PandaRobot) -> None:
         self.robot = robot
-        self.viewer = None
+        self.viewer: Optional[Any] = None
 
     def launch(self) -> None:
-        """启动可视化窗口"""
-        self.viewer = mujoco.viewer.launch_passive(self.robot.model, self.robot.data)
-        self._setup_camera()
-        print("✓ 可视化窗口已启动")
+        """启动可视化窗口；如果启动失败，则继续以无可视化模式运行。"""
+        model, data = self.robot._require_model_data()
+
+        try:
+            self.viewer = mujoco.viewer.launch_passive(model, data)
+            self._setup_camera()
+            print("✓ 可视化窗口已启动")
+        except Exception as exc:
+            self.viewer = None
+            print("⚠ 可视化窗口启动失败，程序将以无可视化模式继续运行")
+            print(f"  失败原因: {exc}")
 
     def _setup_camera(self) -> None:
-        """设置相机视角 - 针对立式倒8字形优化"""
-        self.viewer.cam.lookat = np.array([0.45, 0, 0.45])
-        self.viewer.cam.distance = 2.2
-        self.viewer.cam.azimuth = 35
-        self.viewer.cam.elevation = -20
-
-    def add_marker(self, position: np.ndarray, color: List[float], radius: float = 0.025) -> None:
-        """
-        添加3D标记点(彩色小球)
-        Args:
-            position: 位置 [x, y, z]
-            color: 颜色 [r, g, b]
-            radius: 半径
-        """
+        """设置相机视角。"""
         if self.viewer is None:
             return
 
-        user_scene = self.viewer.user_scn
-        marker_idx = user_scene.ngeom
+        viewer_obj = cast(Any, self.viewer)
+        viewer_obj.cam.lookat = np.array([0.2, 0, 0.4], dtype=float)
+        viewer_obj.cam.distance = 2.5
+        viewer_obj.cam.azimuth = 90
+        viewer_obj.cam.elevation = -20
 
-        if marker_idx >= 100:
-            print(" 标记点数量已达上限(100)")
+    def add_marker(
+        self,
+        position: np.ndarray,
+        color: List[float],
+        radius: float = 0.025,
+    ) -> None:
+        """添加球形标记点。"""
+        if self.viewer is None:
             return
 
-        geom = user_scene.geoms[marker_idx]
-        mujoco.mjv_initGeom(
+        viewer_obj = cast(Any, self.viewer)
+        user_scene = viewer_obj.user_scn
+        marker_index = int(user_scene.ngeom)
+
+        if marker_index >= 100:
+            print("⚠ 标记点数量已达上限")
+            return
+
+        geom = user_scene.geoms[marker_index]
+
+        # 忽略 PyCharm 对 mjv_initGeom 参数列表的误报
+        # noinspection PyArgumentList
+        mujoco.mjv_initGeom(  # type: ignore[call-arg]
             geom,
             type=mujoco.mjtGeom.mjGEOM_SPHERE,
-            size=[radius, 0.0, 0.0],
-            pos=position.astype(np.float64),
-            mat=np.eye(3).flatten().astype(np.float64),
-            rgba=np.array(color + [1.0], dtype=np.float32)
+            size=np.array([radius, 0.0, 0.0], dtype=np.float64),
+            pos=np.asarray(position, dtype=np.float64),
+            mat=np.eye(3, dtype=np.float64).flatten(),
+            rgba=np.array(color + [1.0], dtype=np.float32),
         )
+
         user_scene.ngeom += 1
 
-    def add_trajectory_line(self, trajectory: List[np.ndarray], color: List[float],
-                            line_width: float = 0.006) -> None:
-        """
-        添加连续曲线轨迹(使用圆柱体线段)
-        Args:
-            trajectory: 轨迹点列表
-            color: 颜色 [r, g, b]
-            line_width: 线条宽度
-        """
+    def add_trajectory_line(
+        self,
+        trajectory: List[np.ndarray],
+        color: List[float],
+        line_width: float = 0.006,
+    ) -> None:
+        """使用短圆柱线段绘制轨迹曲线。"""
         if self.viewer is None or len(trajectory) < 2:
             return
 
-        user_scene = self.viewer.user_scn
-        start_idx = user_scene.ngeom
+        viewer_obj = cast(Any, self.viewer)
+        user_scene = viewer_obj.user_scn
+        start_index = int(user_scene.ngeom)
 
         added_count = 0
 
-        for i in range(len(trajectory) - 1):
-            geom_idx = start_idx + i
-            if geom_idx >= 100:
-                print(f"   线段数量已达上限 ({geom_idx}/100)")
+        for index in range(len(trajectory) - 1):
+            geom_index = start_index + index
+
+            if geom_index >= 100:
+                print(f"  ⚠ 线段数量已达上限: {geom_index}/100")
                 break
 
-            p1 = trajectory[i]
-            p2 = trajectory[i + 1]
+            p1 = np.asarray(trajectory[index], dtype=float)
+            p2 = np.asarray(trajectory[index + 1], dtype=float)
 
-            # 计算线段中点
-            center = (p1 + p2) / 2
-
-            # 计算方向向量和长度
+            center = (p1 + p2) / 2.0
             direction = p2 - p1
-            length = np.linalg.norm(direction)
+            length = float(np.linalg.norm(direction))
 
             if length < 0.001:
                 continue
 
-            # 归一化方向
             direction = direction / length
 
-            # 计算旋转矩阵
-            z_axis = np.array([0, 0, 1])
-            rot_axis = np.cross(z_axis, direction)
-            rot_axis_norm = np.linalg.norm(rot_axis)
+            z_axis = np.array([0.0, 0.0, 1.0], dtype=float)
+            rotation_axis = np.cross(z_axis, direction)
+            rotation_axis_norm = float(np.linalg.norm(rotation_axis))
 
-            if rot_axis_norm < 0.001:
-                rot_mat = np.eye(3)
+            if rotation_axis_norm < 0.001:
+                rotation_matrix = np.eye(3, dtype=float)
             else:
-                rot_axis = rot_axis / rot_axis_norm
-                angle = np.arccos(np.clip(np.dot(z_axis, direction), -1, 1))
+                rotation_axis = rotation_axis / rotation_axis_norm
+                angle = float(np.arccos(np.clip(np.dot(z_axis, direction), -1.0, 1.0)))
 
-                # 罗德里格斯旋转公式
-                K = np.array([
-                    [0, -rot_axis[2], rot_axis[1]],
-                    [rot_axis[2], 0, -rot_axis[0]],
-                    [-rot_axis[1], rot_axis[0], 0]
-                ])
-                rot_mat = np.eye(3) + np.sin(angle) * K + (1 - np.cos(angle)) * K @ K
+                k_matrix = np.array(
+                    [
+                        [0.0, -rotation_axis[2], rotation_axis[1]],
+                        [rotation_axis[2], 0.0, -rotation_axis[0]],
+                        [-rotation_axis[1], rotation_axis[0], 0.0],
+                    ],
+                    dtype=float,
+                )
 
-            # 创建圆柱体线段
-            geom = user_scene.geoms[geom_idx]
-            mujoco.mjv_initGeom(
+                rotation_matrix = (
+                    np.eye(3, dtype=float)
+                    + np.sin(angle) * k_matrix
+                    + (1.0 - np.cos(angle)) * k_matrix @ k_matrix
+                )
+
+            geom = user_scene.geoms[geom_index]
+
+            # 忽略 PyCharm 对 mjv_initGeom 参数列表的误报
+            # noinspection PyArgumentList
+            mujoco.mjv_initGeom(  # type: ignore[call-arg]
                 geom,
                 type=mujoco.mjtGeom.mjGEOM_CYLINDER,
-                size=[line_width, length / 2, line_width],
-                pos=center.astype(np.float64),
-                mat=rot_mat.flatten().astype(np.float64),
-                rgba=np.array(color + [0.9], dtype=np.float32)
+                size=np.array([line_width, length / 2.0, line_width], dtype=np.float64),
+                pos=np.asarray(center, dtype=np.float64),
+                mat=np.asarray(rotation_matrix.flatten(), dtype=np.float64),
+                rgba=np.array(color + [0.9], dtype=np.float32),
             )
+
             user_scene.ngeom += 1
             added_count += 1
 
         print(f"  ✓ 已绘制 {added_count} 条轨迹线段")
 
     def sync(self) -> None:
-        """同步视图"""
+        """同步可视化窗口。"""
         if self.viewer is not None:
-            self.viewer.sync()
+            cast(Any, self.viewer).sync()
 
     def is_running(self) -> bool:
-        """检查窗口是否运行中"""
-        return self.viewer is not None and self.viewer.is_running()
+        """检查可视化窗口是否仍在运行。"""
+        if self.viewer is None:
+            return False
+
+        return bool(cast(Any, self.viewer).is_running())
 
     def close(self) -> None:
-        """关闭窗口"""
+        """关闭可视化窗口。"""
         if self.viewer is not None:
-            self.viewer.close()
+            cast(Any, self.viewer).close()
+            self.viewer = None
 
 
 # ============================================
 # 主程序
 # ============================================
-def main():
-    """主函数"""
+def main() -> None:
+    """主函数。"""
     print("\n" + "=" * 60)
-    print("Panda机械臂立式倒8字形轨迹跟踪控制程序")
+    print("Panda 机械臂立式倒 8 字形轨迹跟踪控制程序")
     print("=" * 60)
 
-    # 1. 初始化配置
     config = RobotConfig()
-    # 设置为立式倒8字形（面对自己）
     config.trajectory_orientation = "vertical_xz"
 
-    # 2. 初始化机器人
     robot = PandaRobot(config)
     robot.load_model()
     robot.setup_joint_indices()
     robot.set_home_position()
 
-    # 3. 获取初始位置
     start_pos = robot.get_end_effector_position()
-    print(f"\n初始末端位置: ({start_pos[0]:.3f}, {start_pos[1]:.3f}, {start_pos[2]:.3f})")
+    print(f"\n初始末端位置: {format_pos(start_pos)}")
 
-    # 4. 初始化组件
     ik_solver = InverseKinematicsSolver(robot, config)
-    motion_ctrl = MotionController(robot, config)
+    motion_controller = MotionController(robot, config)
     visualizer = Visualizer(robot)
 
-    # 5. 启动可视化
     visualizer.launch()
 
-    # 6. 生成倒8字形轨迹
+    if config.trajectory_center is None:
+        raise RuntimeError("轨迹中心尚未初始化。")
+
     trajectory_generator = Figure8Trajectory(
         center=config.trajectory_center,
         size=config.trajectory_size,
         height=config.trajectory_height,
-        orientation=config.trajectory_orientation
+        orientation=config.trajectory_orientation,
     )
 
-    # 生成用于显示的轨迹点（较少的点，确保完整显示）
-    trajectory_display = trajectory_generator.generate_trajectory(config.trajectory_display_points)
+    trajectory_display = trajectory_generator.generate_trajectory(
+        config.trajectory_display_points
+    )
 
-    # 生成用于控制的轨迹点（密集的点，保证运动平滑）
-    trajectory_control = trajectory_generator.generate_trajectory(config.trajectory_control_points)
+    trajectory_control = trajectory_generator.generate_trajectory(
+        config.trajectory_control_points
+    )
 
-    # 打印轨迹方向说明
     orientation_names = {
-        "horizontal_xy": "水平倒8字形（XY平面）",
-        "vertical_xz": "立式倒8字形（XZ平面，面对Y轴正方向）",
-        "vertical_yz": "侧立式倒8字形（YZ平面，面对X轴正方向）"
+        "horizontal_xy": "水平倒 8 字形，XY 平面",
+        "vertical_xz": "立式倒 8 字形，XZ 平面",
+        "vertical_yz": "侧立式倒 8 字形，YZ 平面",
     }
 
-    print(f"\n【立式倒8字形轨迹参数】")
-    print(f"  轨迹方向: {orientation_names.get(config.trajectory_orientation, config.trajectory_orientation)}")
-    print(f"  轨迹中心: ({config.trajectory_center[0]:.3f}, {config.trajectory_center[1]:.3f}, {config.trajectory_center[2]:.3f})")
+    print("\n【立式倒 8 字形轨迹参数】")
+    print(
+        "  轨迹方向: "
+        f"{orientation_names.get(config.trajectory_orientation, config.trajectory_orientation)}"
+    )
+    print(f"  轨迹中心: {format_pos(config.trajectory_center)}")
     print(f"  轨迹大小: {config.trajectory_size:.3f} m")
     print(f"  高度波动: {config.trajectory_height:.3f} m")
     print(f"  显示点数: {config.trajectory_display_points}")
     print(f"  控制点数: {config.trajectory_control_points}")
 
-    # 7. 添加轨迹可视化
     print("\n【添加轨迹标记】")
-    visualizer.add_trajectory_line(trajectory_display, [1.0, 0.8, 0.0], line_width=0.006)
+    visualizer.add_trajectory_line(
+        trajectory=trajectory_display,
+        color=[1.0, 0.8, 0.0],
+        line_width=0.006,
+    )
 
-    # 添加关键点标记
-    visualizer.add_marker(config.trajectory_center, [1.0, 0.0, 0.0], radius=0.012)  # 中心-红色
+    visualizer.add_marker(
+        position=config.trajectory_center,
+        color=[1.0, 0.0, 0.0],
+        radius=0.012,
+    )
 
     visualizer.sync()
 
-    print("\n  金色曲线 = 立式倒8字形轨迹路径")
-    print("  绿色小球 = 轨迹起点")
-    print("  红色小球 = 轨迹终点")
-    print("  白色小球 = 轨迹中心")
+    print("\n  金色曲线 = 立式倒 8 字形轨迹路径")
+    print("  红色小球 = 轨迹中心")
 
-    # 8. 移动到轨迹起点
-    print("\n【步骤1】移动到轨迹起点...")
-    success, error = motion_ctrl.move_to_position(
-        trajectory_control[0], ik_solver, visualizer.viewer
+    print("\n【步骤 1】移动到轨迹起点...")
+    success, error = motion_controller.move_to_position(
+        target_pos=trajectory_control[0],
+        ik_solver=ik_solver,
+        viewer_obj=visualizer.viewer,
     )
 
     if success:
-        print(f"  ✓ 到达轨迹起点, 误差: {error * 1000:.2f} mm")
+        print(f"  ✓ 到达轨迹起点，误差: {error * 1000.0:.2f} mm")
     else:
-        print(f"   移动到起点失败")
+        print("  ⚠ 移动到起点失败")
 
-    time.sleep(1)
+    time.sleep(1.0)
 
-    # 9. 跟踪倒8字形轨迹
-    print("\n【步骤2】跟踪立式倒8字形轨迹...")
+    print("\n【步骤 2】跟踪立式倒 8 字形轨迹...")
     print("-" * 60)
 
-    motion_ctrl.follow_trajectory(trajectory_control, ik_solver, visualizer.viewer)
+    motion_controller.follow_trajectory(
+        trajectory=trajectory_control,
+        ik_solver=ik_solver,
+        viewer_obj=visualizer.viewer,
+    )
 
-    # 10. 完成
     print("\n" + "=" * 60)
-    print("✓ 立式倒8字形轨迹跟踪完成!")
+    print("✓ 立式倒 8 字形轨迹跟踪完成")
     print("=" * 60)
 
     final_pos = robot.get_end_effector_position()
-    print(f"\n最终末端位置: ({final_pos[0]:.3f}, {final_pos[1]:.3f}, {final_pos[2]:.3f})")
+    print(f"\n最终末端位置: {format_pos(final_pos)}")
 
-    # 11. 保持窗口打开
-    print("\n关闭窗口退出...")
-    try:
-        while visualizer.is_running():
-            visualizer.sync()
-            time.sleep(0.01)
-    except KeyboardInterrupt:
-        print("\n程序退出")
-    finally:
-        visualizer.close()
+    if visualizer.viewer is not None:
+        print("\n关闭窗口退出...")
+
+        try:
+            while visualizer.is_running():
+                visualizer.sync()
+                time.sleep(0.01)
+        except KeyboardInterrupt:
+            print("\n程序退出")
+        finally:
+            visualizer.close()
+    else:
+        print("\n无可视化模式运行结束。")
+
 
 if __name__ == "__main__":
     main()

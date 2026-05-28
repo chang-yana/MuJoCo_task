@@ -24,13 +24,31 @@
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple, cast
 
 import mujoco
 import mujoco.viewer
 import numpy as np
 from scipy.optimize import minimize
 
+
+# ============================================================================
+# 类型与格式化辅助函数
+# ============================================================================
+
+def format_pos(pos: np.ndarray) -> str:
+    """将三维坐标格式化为字符串，避免 ndarray 直接格式化产生类型检查警告。"""
+    return (
+        f"({float(pos[0]):.3f}, "
+        f"{float(pos[1]):.3f}, "
+        f"{float(pos[2]):.3f})"
+    )
+
+
+def sync_viewer(viewer_obj: Optional[Any]) -> None:
+    """安全同步 MuJoCo 可视化窗口。"""
+    if viewer_obj is not None:
+        cast(Any, viewer_obj).sync()
 
 # ============================================================================
 # 配置参数类
@@ -155,7 +173,7 @@ class RobotConfig:
             x, y = self.place_areas[area]
         else:
             x, y = 0.65, 0
-        return np.array([x, y, self.cube_center_z])
+        return np.array([float(x), float(y), self.cube_center_z], dtype=float)
 
 
 # ============================================================================
@@ -197,9 +215,9 @@ class VLMUnderstanding:
                 "color": "红色",
                 "shape": "立方体",
                 "position": {
-                    "x": cube_center[0],
-                    "y": cube_center[1],
-                    "z": cube_center[2]
+                    "x": float(cube_center[0]),
+                    "y": float(cube_center[1]),
+                    "z": float(cube_center[2])
                 }
             })
 
@@ -240,6 +258,7 @@ class LLMTaskPlanner:
         Args:
             api_key: API密钥（当前未使用，保留接口）
         """
+        self.api_key = api_key
         print("⚠ Using rule-based command parser")
 
     def plan(self, user_command: str) -> Dict[str, Any]:
@@ -352,7 +371,7 @@ class MPCController:
             速度因子（0.3 ~ 1.0）
         """
         current_pos = self.robot.get_fingertip_position()
-        distance = np.linalg.norm(current_pos - target_pos)
+        distance = float(np.linalg.norm(current_pos - target_pos))
 
         # 获取最近的物体距离
         scene = self.vlm.analyze_scene()
@@ -360,7 +379,7 @@ class MPCController:
 
         for obj in scene["objects"]:
             obj_pos = np.array([obj["position"]["x"], obj["position"]["y"], obj["position"]["z"]])
-            min_obj_dist = min(min_obj_dist, np.linalg.norm(current_pos - obj_pos))
+            min_obj_dist = min(min_obj_dist, float(np.linalg.norm(current_pos - obj_pos)))
 
         min_distance = min(distance, min_obj_dist)
 
@@ -385,7 +404,7 @@ class MPCController:
             自适应步数（50 ~ 400）
         """
         current_pos = self.robot.get_fingertip_position()
-        distance = np.linalg.norm(current_pos - target_pos)
+        distance = float(np.linalg.norm(current_pos - target_pos))
         speed_factor = self.calculate_speed_factor(target_pos)
 
         base_steps = self.config.move_steps
@@ -469,20 +488,20 @@ class PandaRobot:
             config: 机器人配置
         """
         self.config = config
-        self.model = None
-        self.data = None
+        self.model: Any = None
+        self.data: Any = None
         self.arm_indices = []
         self.finger_indices = []
-        self.left_finger_id = None
-        self.right_finger_id = None
-        self.left_finger_tip_id = None
-        self.right_finger_tip_id = None
-        self.renderer = None
+        self.left_finger_id: Optional[int] = None
+        self.right_finger_id: Optional[int] = None
+        self.left_finger_tip_id: Optional[int] = None
+        self.right_finger_tip_id: Optional[int] = None
+        self.renderer: Any = None
         self.gripper_closed = False
         self.grasped_object = None
         self.object_offset = np.array([0, 0, 0])
-        self.cube_body_id = None
-        self.cube_jnt_addr = None
+        self.cube_body_id: Optional[int] = None
+        self.cube_jnt_addr: Optional[int] = None
 
         self.arm_joint_names = ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6", "joint7"]
         self.finger_joint_names = ["finger_joint1", "finger_joint2"]
@@ -529,10 +548,12 @@ class PandaRobot:
         try:
             self.left_finger_tip_id = self.model.site("left_finger_tip").id
             self.right_finger_tip_id = self.model.site("right_finger_tip").id
+        # noinspection PyBroadException
         except Exception:
             try:
                 self.left_finger_tip_id = self.model.site("left_fingertip").id
                 self.right_finger_tip_id = self.model.site("right_fingertip").id
+            # noinspection PyBroadException
             except Exception:
                 self.left_finger_tip_id = None
                 self.right_finger_tip_id = None
@@ -546,6 +567,7 @@ class PandaRobot:
             self.cube_body_id = self.model.body("red_cube").id
             self.cube_jnt_addr = self.model.body_jntadr[self.cube_body_id]
             print("  ✅ Red cube found")
+        # noinspection PyBroadException
         except Exception as e:
             print(f"  ❌ Red cube not found: {e}")
 
@@ -666,7 +688,7 @@ class PandaRobot:
             left_tip = left_tip + tip_offset
             right_tip = right_tip + tip_offset
 
-        return np.linalg.norm(left_tip - right_tip)
+        return float(np.linalg.norm(left_tip - right_tip))
 
     # ------------------------------------------------------------------------
     # 夹爪控制方法
@@ -689,7 +711,7 @@ class PandaRobot:
     def set_gripper_width(
         self,
         target_contact_width: float,
-        viewer_obj=None,
+        viewer_obj: Optional[Any] = None,
         steps: int = 20,
     ) -> bool:
         """
@@ -706,11 +728,9 @@ class PandaRobot:
             “内侧指垫接触面间距”，而不是两个指尖 site 的空间距离。
 
             Panda 夹爪两个手指对称运动时，可近似认为：
-
                 contact_width = finger_joint1 + finger_joint2
 
             因此单个 finger_joint 的目标位置为：
-
                 single_finger_qpos = contact_width / 2
 
             get_gripper_width() 测得的是两个指尖 site 的距离，只作为观测和调试信息，
@@ -766,8 +786,7 @@ class PandaRobot:
 
             self._apply_finger_position(current_finger_pos)
 
-            if viewer_obj:
-                viewer_obj.sync()
+            sync_viewer(viewer_obj)
 
             time.sleep(0.01)
 
@@ -861,6 +880,7 @@ class PandaRobot:
             vel_addr = self.cube_jnt_addr * 2
             if vel_addr + 6 <= len(self.data.qvel):
                 self.data.qvel[vel_addr:vel_addr + 6] = 0
+        # noinspection PyBroadException
         except Exception:
             # 物体附着更新失败时跳过本帧，避免仿真循环中断。
             pass
@@ -910,13 +930,14 @@ class InverseKinematicsSolver:
         Returns:
             关节限位列表
         """
-        bounds = []
-        for i, idx in enumerate(self.robot.arm_indices):
-            jr = self.robot.model.jnt_range[idx]
-            if jr[0] == 0 and jr[1] == 0:
-                bounds.append(self.config.joint_limits[i])
+        bounds: List[Tuple[float, float]] = []
+        for index, joint_name in enumerate(self.robot.arm_joint_names):
+            joint_id = self.robot.model.joint(joint_name).id
+            joint_range = self.robot.model.jnt_range[joint_id]
+            if float(joint_range[0]) == 0.0 and float(joint_range[1]) == 0.0:
+                bounds.append(self.config.joint_limits[index])
             else:
-                bounds.append((float(jr[0]), float(jr[1])))
+                bounds.append((float(joint_range[0]), float(joint_range[1])))
         return bounds
 
     def solve(
@@ -937,27 +958,32 @@ class InverseKinematicsSolver:
         if initial_guess is None:
             initial_guess = self.robot.get_current_joint_angles()
 
-        best_solution = None
-        best_error = float('inf')
-        x0 = initial_guess.copy()
+        best_solution: Optional[np.ndarray] = None
+        best_error: float = float('inf')
+        x0 = np.asarray(initial_guess.copy(), dtype=float)
 
         for attempt in range(self.config.ik_max_attempts):
             if attempt > 0:
-                x0 = initial_guess + np.random.uniform(-0.1, 0.1, 7)
+                x0 = np.asarray(initial_guess + np.random.uniform(-0.1, 0.1, 7), dtype=float)
 
             # 确保初始值在限位内
             for i, (low, high) in enumerate(self._get_bounds()):
-                x0[i] = np.clip(x0[i], low + 0.01, high - 0.01)
+                x0[i] = float(np.clip(float(x0[i]), low + 0.01, high - 0.01))
 
-            result = minimize(
-                self._ik_cost, x0, args=(target_pos,),
-                method='L-BFGS-B', bounds=self._get_bounds(),
-                options={'maxiter': self.config.ik_max_iter}
+            minimize_func = cast(Any, minimize)
+            result = minimize_func(
+                self._ik_cost,
+                np.asarray(x0, dtype=float),
+                args=(np.asarray(target_pos, dtype=float),),
+                method="L-BFGS-B",
+                bounds=self._get_bounds(),
+                options={"maxiter": int(self.config.ik_max_iter)},
             )
 
-            if result.fun < best_error:
-                best_error = result.fun
-                best_solution = result.x
+            result_error = float(result.fun)
+            if result_error < best_error:
+                best_error = result_error
+                best_solution = np.asarray(result.x, dtype=float)
 
             if best_error < 0.03:
                 break
@@ -1004,8 +1030,8 @@ class MotionController:
         """
         return t * t * (3 - 2 * t)
 
-    def move_to_joints(self, target_joints: np.ndarray, viewer_obj=None,
-                       move_steps: int = None) -> None:
+    def move_to_joints(self, target_joints: np.ndarray, viewer_obj: Optional[Any] = None,
+                       move_steps: Optional[int] = None) -> None:
         """
         平滑移动到目标关节角度
 
@@ -1015,7 +1041,7 @@ class MotionController:
             move_steps: 运动步数（可选）
         """
         if move_steps is None:
-            move_steps = self.config.move_steps
+            move_steps = int(self.config.move_steps)
 
         start_joints = self.robot.get_current_joint_angles()
 
@@ -1026,12 +1052,11 @@ class MotionController:
             self.robot.apply_joint_angles(current_joints)
             self.robot.update_attached_object_position()
 
-            if viewer_obj:
-                viewer_obj.sync()
+            sync_viewer(viewer_obj)
             time.sleep(self.config.move_dt)
 
-    def move_to_position(self, target_pos: np.ndarray, ik_solver,
-                         viewer_obj=None) -> Tuple[bool, float]:
+    def move_to_position(self, target_pos: np.ndarray, ik_solver: "InverseKinematicsSolver",
+                         viewer_obj: Optional[Any] = None) -> Tuple[bool, float]:
         """
         移动到目标空间位置
 
@@ -1060,8 +1085,8 @@ class MotionController:
 
         return True, float(np.linalg.norm(actual_pos - target_pos))
 
-    def follow_trajectory(self, trajectory: List[np.ndarray], ik_solver,
-                          viewer_obj=None) -> None:
+    def follow_trajectory(self, trajectory: List[np.ndarray], ik_solver: "InverseKinematicsSolver",
+                          viewer_obj: Optional[Any] = None) -> None:
         """
         跟踪轨迹点序列
 
@@ -1070,7 +1095,7 @@ class MotionController:
             ik_solver: IK求解器
             viewer_obj: 可视化对象
         """
-        print(f"      Trajectory points: {len(trajectory)}")
+        print(f"      轨迹点数: {len(trajectory)}")
         current_angles = self.robot.get_current_joint_angles()
         success = 0
 
@@ -1082,16 +1107,15 @@ class MotionController:
                 current_angles = solution
                 success += 1
 
-                if viewer_obj:
-                    viewer_obj.sync()
+                sync_viewer(viewer_obj)
                 time.sleep(self.config.figure8_duration_per_point)
 
             if (i + 1) % 20 == 0:
                 percent = (i + 1) * 100 // len(trajectory)
-                print(f"\r      Progress: {percent}%", end="", flush=True)
+                print(f"\r      进度: {percent}%", end="", flush=True)
 
-        print(f"\r      Progress: 100% ✓")
-        print(f"      Success rate: {success}/{len(trajectory)} ({100 * success / len(trajectory):.1f}%)")
+        print("\r      进度: 100% ✓")
+        print(f"      成功率: {success}/{len(trajectory)} ({100.0 * success / len(trajectory):.1f}%)")
 
 
 # ============================================================================
@@ -1117,28 +1141,41 @@ class Visualizer:
             robot: PandaRobot实例
         """
         self.robot = robot
-        self.viewer = None
+        self.viewer: Optional[Any] = None
 
     def launch(self) -> None:
-        """启动可视化窗口"""
-        self.viewer = mujoco.viewer.launch_passive(self.robot.model, self.robot.data)
-        self._setup_camera()
-        print("✓ Visualization window started")
+        """启动可视化窗口，失败时进入无可视化模式。"""
+        try:
+            self.viewer = mujoco.viewer.launch_passive(self.robot.model, self.robot.data)
+            self._setup_camera()
+            print("✓ 可视化窗口已启动")
+        except RuntimeError as exc:
+            self.viewer = None
+            print("⚠ 可视化窗口启动失败，程序将以无可视化模式继续运行")
+            print(f"  失败原因: {exc}")
 
     def _setup_camera(self) -> None:
-        """设置相机视角"""
-        self.viewer.cam.lookat = np.array([0.65, 0, 0.4])
-        self.viewer.cam.distance = 2.5
-        self.viewer.cam.azimuth = 45
-        self.viewer.cam.elevation = -25
+        """设置相机视角。"""
+        if self.viewer is None:
+            return
+
+        viewer_obj = cast(Any, self.viewer)
+        viewer_obj.cam.lookat = np.array([0.65, 0.0, 0.4], dtype=float)
+        viewer_obj.cam.distance = 2.5
+        viewer_obj.cam.azimuth = 145
+        viewer_obj.cam.elevation = -15
+
+        # 设置可视化菜单字体为 150%。
+        if hasattr(viewer_obj, "gui"):
+            viewer_obj.gui.font = 1.5
 
     def clear_trajectory(self) -> None:
         """清除轨迹"""
-        if self.viewer:
-            self.viewer.user_scn.ngeom = 0
+        if self.viewer is not None:
+            cast(Any, self.viewer).user_scn.ngeom = 0
 
     def draw_trajectory(self, trajectory: List[np.ndarray],
-                        color: List[float] = None) -> None:
+                        color: Optional[List[float]] = None) -> None:
         """
         绘制轨迹线
 
@@ -1152,7 +1189,8 @@ class Visualizer:
         if self.viewer is None or len(trajectory) < 2:
             return
 
-        user_scene = self.viewer.user_scn
+        viewer_obj = cast(Any, self.viewer)
+        user_scene = viewer_obj.user_scn
         start_idx = user_scene.ngeom
         line_width = 0.006
 
@@ -1163,7 +1201,7 @@ class Visualizer:
             p1, p2 = trajectory[i], trajectory[i + 1]
             center = (p1 + p2) / 2
             direction = p2 - p1
-            length = np.linalg.norm(direction)
+            length = float(np.linalg.norm(direction))
 
             if length < 0.001:
                 continue
@@ -1173,13 +1211,13 @@ class Visualizer:
             # 计算旋转矩阵
             z_axis = np.array([0, 0, 1])
             rot_axis = np.cross(z_axis, direction)
-            rot_norm = np.linalg.norm(rot_axis)
+            rot_norm = float(np.linalg.norm(rot_axis))
 
             if rot_norm < 0.001:
                 rot_mat = np.eye(3)
             else:
                 rot_axis = rot_axis / rot_norm
-                angle = np.arccos(np.clip(np.dot(z_axis, direction), -1, 1))
+                angle = float(np.arccos(np.clip(np.dot(z_axis, direction), -1.0, 1.0)))
                 K = np.array([
                     [0, -rot_axis[2], rot_axis[1]],
                     [rot_axis[2], 0, -rot_axis[0]],
@@ -1188,11 +1226,14 @@ class Visualizer:
                 rot_mat = np.eye(3) + np.sin(angle) * K + (1 - np.cos(angle)) * K @ K
 
             geom = user_scene.geoms[start_idx + i]
-            mujoco.mjv_initGeom(
-                geom, mujoco.mjtGeom.mjGEOM_CYLINDER,
-                [line_width, length / 2, line_width],
-                center.astype(np.float64), rot_mat.flatten().astype(np.float64),
-                np.array(color + [0.9], dtype=np.float32)
+            # noinspection PyArgumentList
+            mujoco.mjv_initGeom(  # type: ignore[call-arg]
+                geom,
+                type=mujoco.mjtGeom.mjGEOM_CYLINDER,
+                size=np.array([line_width, length / 2.0, line_width], dtype=np.float64),
+                pos=np.asarray(center, dtype=np.float64),
+                mat=np.asarray(rot_mat.flatten(), dtype=np.float64),
+                rgba=np.array(color + [0.9], dtype=np.float32),
             )
             user_scene.ngeom += 1
 
@@ -1208,32 +1249,36 @@ class Visualizer:
         if self.viewer is None:
             return
 
-        idx = self.viewer.user_scn.ngeom
+        viewer_obj = cast(Any, self.viewer)
+        idx = int(viewer_obj.user_scn.ngeom)
         if idx >= 100:
             return
 
-        geom = self.viewer.user_scn.geoms[idx]
-        mujoco.mjv_initGeom(
-            geom, mujoco.mjtGeom.mjGEOM_SPHERE,
-            [radius, 0, 0], pos.astype(np.float64),
-            np.eye(3).flatten().astype(np.float64),
-            np.array(color + [1.0], dtype=np.float32)
+        geom = viewer_obj.user_scn.geoms[idx]
+        # noinspection PyArgumentList
+        mujoco.mjv_initGeom(  # type: ignore[call-arg]
+            geom,
+            type=mujoco.mjtGeom.mjGEOM_SPHERE,
+            size=np.array([radius, 0.0, 0.0], dtype=np.float64),
+            pos=np.asarray(pos, dtype=np.float64),
+            mat=np.eye(3, dtype=np.float64).flatten(),
+            rgba=np.array(color + [1.0], dtype=np.float32),
         )
-        self.viewer.user_scn.ngeom += 1
+        viewer_obj.user_scn.ngeom += 1
 
     def sync(self) -> None:
         """同步视图"""
-        if self.viewer:
-            self.viewer.sync()
+        if self.viewer is not None:
+            cast(Any, self.viewer).sync()
 
     def is_running(self) -> bool:
         """检查窗口是否运行中"""
-        return self.viewer is not None and self.viewer.is_running()
+        return self.viewer is not None and bool(cast(Any, self.viewer).is_running())
 
     def close(self) -> None:
         """关闭窗口"""
-        if self.viewer:
-            self.viewer.close()
+        if self.viewer is not None:
+            cast(Any, self.viewer).close()
 
 
 # ============================================================================
@@ -1261,11 +1306,11 @@ class MCPBridge:
 
     def __init__(self) -> None:
         """初始化MCP桥接器"""
-        self.robot = None
-        self.config = None
-        self.figure8_trajectory = None
-        self.visualizer = None
-        self.vlm = None
+        self.robot: Any = None
+        self.config: Any = None
+        self.figure8_trajectory: Any = None
+        self.visualizer: Any = None
+        self.vlm: Any = None
 
     def set_robot(self, robot: PandaRobot) -> None:
         """设置机器人引用"""
@@ -1281,14 +1326,16 @@ class MCPBridge:
         self.visualizer = visualizer
 
     def set_ai_modules(self, vlm: VLMUnderstanding, llm: LLMTaskPlanner, mpc: MPCController) -> None:
-        """设置AI模块引用"""
+        """设置AI模块引用。"""
+        _ = llm
+        _ = mpc
         self.vlm = vlm
 
     # ------------------------------------------------------------------------
     # 抓取执行
     # ------------------------------------------------------------------------
 
-    def execute_grasp(self, motion_ctrl, ik_solver, viewer_obj=None) -> bool:
+    def execute_grasp(self, motion_ctrl: MotionController, ik_solver: InverseKinematicsSolver, viewer_obj: Optional[Any] = None) -> bool:
         """
         执行抓取动作。
 
@@ -1311,7 +1358,7 @@ class MCPBridge:
 
         print(
             f"    📍 Cube center: "
-            f"({cube_center[0]:.3f}, {cube_center[1]:.3f}, {cube_center[2]:.3f})"
+            f"{format_pos(cube_center)}"
         )
 
         # 2. 张开夹爪到略大于立方体宽度。
@@ -1331,7 +1378,7 @@ class MCPBridge:
 
         print(
             f"    📍 Pre-grasp: "
-            f"({pre_grasp[0]:.3f}, {pre_grasp[1]:.3f}, {pre_grasp[2]:.3f})"
+            f"{format_pos(pre_grasp)}"
         )
 
         success, error = motion_ctrl.move_to_position(pre_grasp, ik_solver, viewer_obj)
@@ -1348,7 +1395,7 @@ class MCPBridge:
 
         print(
             f"    📍 Grasp point: "
-            f"({grasp_pos[0]:.3f}, {grasp_pos[1]:.3f}, {grasp_pos[2]:.3f})"
+            f"{format_pos(grasp_pos)}"
         )
 
         success, error = motion_ctrl.move_to_position(grasp_pos, ik_solver, viewer_obj)
@@ -1379,7 +1426,7 @@ class MCPBridge:
 
         print(
             f"    📍 Lift: "
-            f"({lift_pos[0]:.3f}, {lift_pos[1]:.3f}, {lift_pos[2]:.3f})"
+            f"{format_pos(lift_pos)}"
         )
 
         success, error = motion_ctrl.move_to_position(lift_pos, ik_solver, viewer_obj)
@@ -1397,7 +1444,7 @@ class MCPBridge:
     def execute_place(self, motion_ctrl: MotionController,
                       ik_solver: InverseKinematicsSolver,
                       area: str = "center",
-                      viewer_obj: Optional[mujoco.viewer] = None) -> bool:
+                      viewer_obj: Optional[Any] = None) -> bool:
         """
         执行放置操作（预设区域）
 
@@ -1423,7 +1470,7 @@ class MCPBridge:
         cube_center_target = self.config.get_cube_center_position(area)
 
         print(f"\n    📍 Placing at: {area}")
-        print(f"      Cube center target: ({cube_center_target[0]:.3f}, {cube_center_target[1]:.3f}, {cube_center_target[2]:.3f})")
+        print(f"      Cube center target: {format_pos(cube_center_target)}")
         print(f"      Cube bottom: {cube_center_target[2] - self.config.cube_half_height:.3f}")
         print(f"      Table top: {self.config.table_top_z:.3f}")
 
@@ -1465,7 +1512,7 @@ class MCPBridge:
     def execute_place_at_coordinates(self, motion_ctrl: MotionController,
                                      ik_solver: InverseKinematicsSolver,
                                      x: float, y: float,
-                                     viewer_obj: Optional[mujoco.viewer] = None) -> bool:
+                                     viewer_obj: Optional[Any] = None) -> bool:
         """
         执行放置操作（指定坐标）
 
@@ -1480,7 +1527,7 @@ class MCPBridge:
             print("    ❌ No object grasped")
             return False
 
-        # 验证坐标有效性（可选：添加范围检查）
+        # 验证坐标有效性
         if x < 0.3 or x > 1.2:
             print(f"    ⚠ Warning: X coordinate {x:.3f} may be out of reachable range")
         if y < -0.5 or y > 0.5:
@@ -1490,7 +1537,7 @@ class MCPBridge:
 
         print(f"\n    📍 Placing at coordinates: ({x:.3f}, {y:.3f})")
         print(
-            f"      Cube center: ({cube_center_target[0]:.3f}, {cube_center_target[1]:.3f}, {cube_center_target[2]:.3f})")
+            f"      Cube center: {format_pos(cube_center_target)}")
 
         fingertip_target = cube_center_target + np.array([0, 0, self.config.cube_half_height])
 
@@ -1531,7 +1578,7 @@ class MCPBridge:
     def execute_move_relative(self, motion_ctrl: MotionController,
                               ik_solver: InverseKinematicsSolver,
                               direction: str,
-                              viewer_obj: Optional[mujoco.viewer] = None) -> bool:
+                              viewer_obj: Optional[Any] = None) -> bool:
         """
         执行相对移动
 
@@ -1571,7 +1618,7 @@ class MCPBridge:
     def execute_goto(self, motion_ctrl: MotionController,
                      ik_solver: InverseKinematicsSolver,
                      x: float, y: float, z: float,
-                     viewer_obj: Optional[mujoco.viewer] = None) -> bool:
+                     viewer_obj: Optional[Any] = None) -> bool:
         """
         执行绝对移动
 
@@ -1600,7 +1647,7 @@ class MCPBridge:
 
     def execute_figure8(self, motion_ctrl: MotionController,
                         ik_solver: InverseKinematicsSolver,
-                        viewer_obj: Optional[mujoco.viewer] = None) -> bool:
+                        viewer_obj: Optional[Any] = None) -> bool:
         """
         执行8字形轨迹
 
@@ -1637,7 +1684,7 @@ class MCPBridge:
 
     def execute_home(self, motion_ctrl: MotionController,
                      ik_solver: InverseKinematicsSolver,
-                     viewer_obj: Optional[mujoco.viewer] = None) -> bool:
+                     viewer_obj: Optional[Any] = None) -> bool:
         """
         平滑回家
 
@@ -1646,6 +1693,7 @@ class MCPBridge:
             ik_solver: IK求解器
             viewer_obj: 可视化对象
         """
+        _ = ik_solver
         print("    🏠 Returning to home position smoothly...")
 
         home_angles = np.array([
@@ -1670,7 +1718,7 @@ class MCPBridge:
 
     def execute_release(self, motion_ctrl: MotionController,
                         ik_solver: InverseKinematicsSolver,
-                        viewer_obj: Optional[mujoco.viewer] = None) -> bool:
+                        viewer_obj: Optional[Any] = None) -> bool:
         """
         释放物体
 
@@ -1679,6 +1727,10 @@ class MCPBridge:
             ik_solver: IK求解器
             viewer_obj: 可视化对象
         """
+        _ = motion_ctrl
+        _ = ik_solver
+        _ = viewer_obj
+
         if self.robot.grasped_object is not None:
             print("    Releasing object...")
             self.robot.open_gripper_wide()
@@ -1695,7 +1747,7 @@ class MCPBridge:
     def execute_command(self, command: Dict[str, Any],
                         motion_ctrl: MotionController,
                         ik_solver: InverseKinematicsSolver,
-                        viewer_obj: Optional[mujoco.viewer] = None) -> bool:
+                        viewer_obj: Optional[Any] = None) -> bool:
         """
         执行解析后的命令
 
@@ -1731,18 +1783,27 @@ class MCPBridge:
             return self.execute_place(motion_ctrl, ik_solver, area, viewer_obj)
 
         elif action == "place_at":
-            pos = command.get("position", None)
-            if pos is None or len(pos) < 2:
-                print(f"    ❌ Invalid place_at command - missing coordinates")
-                print(f"    💡 Use: 'place_at x y' or '放 x y'")
+            raw_pos = command.get("position")
+            if not isinstance(raw_pos, (list, tuple)) or len(raw_pos) < 2:
+                print("    ❌ Invalid place_at command - missing coordinates")
+                print("    💡 Use: 'place_at x y' or '放 x y'")
                 return False
-            return self.execute_place_at_coordinates(motion_ctrl, ik_solver, pos[0], pos[1], viewer_obj)
+            pos = cast(Sequence[float], raw_pos)
+            return self.execute_place_at_coordinates(
+                motion_ctrl, ik_solver, float(pos[0]), float(pos[1]), viewer_obj
+            )
         elif action == "move":
             direction = command.get("direction", "forward")
             return self.execute_move_relative(motion_ctrl, ik_solver, direction, viewer_obj)
         elif action == "goto":
-            pos = command.get("position", [0.65, 0, 0.45])
-            return self.execute_goto(motion_ctrl, ik_solver, pos[0], pos[1], pos[2], viewer_obj)
+            raw_pos = command.get("position", [0.65, 0.0, 0.45])
+            if not isinstance(raw_pos, (list, tuple)) or len(raw_pos) < 3:
+                print("    ❌ Invalid goto command - missing coordinates")
+                return False
+            pos = cast(Sequence[float], raw_pos)
+            return self.execute_goto(
+                motion_ctrl, ik_solver, float(pos[0]), float(pos[1]), float(pos[2]), viewer_obj
+            )
         elif action == "figure8":
             return self.execute_figure8(motion_ctrl, ik_solver, viewer_obj)
         elif action == "list_objects":
